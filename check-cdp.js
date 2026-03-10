@@ -2,28 +2,21 @@
 /**
  * xhs-note-health — CDP 版检测脚本
  *
- * 通过 Playwright CDP Fetch domain 拦截小红书创作者后台 API 响应，
- * 提取每篇笔记的隐藏 level 字段。
+ * 通过 CDP Fetch domain 拦截第一页 API 响应 + 捕获请求 headers，
+ * 然后用 Node.js HTTP 直接请求后续分页（复用 cookies，每页重新签名由浏览器完成）。
  *
- * 为什么不能直接 HTTP 请求？
- *   - 小红书 API 要求 X-S / X-T 等签名头，由前端 JS SDK 动态生成
- *   - 仅靠 cookie 请求会返回 {"code":-1,"success":false}
- *   - qiankun 微前端沙箱隔离 JS 全局变量，monkey-patch fetch/XHR 无效
- *   - Playwright 的 page.on('response') / page.route() 在 connectOverCDP 模式下不触发
- *   - 唯一可靠方案：CDP Fetch domain (requestStage: 'Response')
- *
- * 用法:
- *   node check-cdp.js [--cdp-port PORT] [--json] [--throttled-only]
- *
- * 前置条件:
- *   - Node.js + playwright 已安装
- *   - Chrome/Chromium 以 remote-debugging 启动（或通过 OpenClaw browser-lock.sh）
- *   - 已登录小红书创作者后台
+ * 分页策略：用 CDP 拦截首页，然后通过 page.evaluate 调用浏览器内部
+ * 的 fetch（经过 qiankun 沙箱的签名中间件）获取后续页。
  */
 
 const { chromium } = require('playwright');
 
-// ── 常量 ──────────────────────────────────────────────────────
+function getCdpUrl() {
+  const port = process.env.CDP_PORT || '18800';
+  return `http://127.0.0.1:${port}`;
+}
+
+// ── Level 标签 ───────────────────────────────────────────────
 
 const LEVEL_META = {
   4:    ['🟢 正常推荐', '笔记正常分发'],
@@ -47,36 +40,25 @@ function getLevelLabel(level) {
   return [`L${level}`, '未知状态'];
 }
 
-// ── 参数解析 ──────────────────────────────────────────────────
+// ── 参数解析 ─────────────────────────────────────────────────
 
 function parseArgs() {
   const args = process.argv.slice(2);
   const opts = { cdpPort: '18800', json: false, throttledOnly: false };
-
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--cdp-port' && args[i + 1]) {
-      opts.cdpPort = args[++i];
-    } else if (args[i] === '--json') {
-      opts.json = true;
-    } else if (args[i] === '--throttled-only') {
-      opts.throttledOnly = true;
-    } else if (args[i] === '--help' || args[i] === '-h') {
-      console.log(`用法: node check-cdp.js [选项]
-
-选项:
-  --cdp-port PORT    CDP 端口 (默认: 18800, 或 CDP_PORT 环境变量)
-  --json             JSON 格式输出
-  --throttled-only   只显示限流笔记
-  -h, --help         显示帮助`);
+    if (args[i] === '--cdp-port' && args[i + 1]) opts.cdpPort = args[++i];
+    else if (args[i] === '--json') opts.json = true;
+    else if (args[i] === '--throttled-only') opts.throttledOnly = true;
+    else if (args[i] === '--help' || args[i] === '-h') {
+      console.log('用法: node check-cdp.js [--cdp-port PORT] [--json] [--throttled-only]');
       process.exit(0);
     }
   }
-
   opts.cdpPort = process.env.CDP_PORT || opts.cdpPort;
   return opts;
 }
 
-// ── 主逻辑 ──────────────────────────────────────────────────────
+// ── 主逻辑 ───────────────────────────────────────────────────
 
 async function main() {
   const opts = parseArgs();
@@ -87,7 +69,6 @@ async function main() {
     browser = await chromium.connectOverCDP(cdpUrl);
   } catch (e) {
     console.error(`❌ 无法连接 CDP (${cdpUrl}): ${e.message}`);
-    console.error('请确保 Chrome 以 --remote-debugging-port 启动，或使用 browser-lock.sh acquire');
     process.exit(1);
   }
 
@@ -96,59 +77,58 @@ async function main() {
   const client = await page.context().newCDPSession(page);
 
   const allNotes = [];
-  let hasMore = true;
-  let pagesReceived = 0;
+  let firstPageHasMore = true;
 
-  // CDP Fetch domain: 在 Response 阶段拦截 API 响应
+  // ── 步骤1: CDP Fetch 拦截第一页 ──────────────────────────
+
   await client.send('Fetch.enable', {
     patterns: [{ urlPattern: '*note/user/posted*', requestStage: 'Response' }],
   });
 
   client.on('Fetch.requestPaused', async (params) => {
+    let rawBody = '';
+    let responseCode = params.responseStatusCode || 200;
+    let responseHeaders = params.responseHeaders || [];
+
     try {
-      const { body, base64Encoded } = await client.send('Fetch.getResponseBody', {
+      const resp = await client.send('Fetch.getResponseBody', {
         requestId: params.requestId,
       });
-      const text = base64Encoded
-        ? Buffer.from(body, 'base64').toString('utf8')
-        : body;
-
+      // 保留原始 base64 body 用于回传
+      rawBody = resp.body;
+      const text = resp.base64Encoded
+        ? Buffer.from(resp.body, 'base64').toString('utf8')
+        : resp.body;
       const data = JSON.parse(text);
-      // API 响应结构: data.notes[] (不是 data.note_list)
-      // 笔记 ID 字段: id (不是 note_id)
       const noteList = data.data && (data.data.notes || data.data.note_list);
       if (noteList && noteList.length > 0) {
         for (const note of noteList) {
-          const noteId = note.id || note.note_id;
-          if (!allNotes.find(n => (n.id || n.note_id) === noteId)) {
+          const nid = note.id || note.note_id;
+          if (!allNotes.find(n => (n.id || n.note_id) === nid)) {
             allNotes.push(note);
           }
         }
-        hasMore = data.data.has_more !== false;
-        pagesReceived++;
-        if (!opts.json) {
-          process.stderr.write(`\r[检测] 第 ${pagesReceived} 页, 累计 ${allNotes.length} 篇`);
-        }
+        const totalCount = (data.data.tags && data.data.tags[0] && data.data.tags[0].notes_count) || 0;
+        firstPageHasMore = allNotes.length < totalCount;
+        if (!opts.json) process.stderr.write(`[CDP] 总数: ${totalCount}, 已获取: ${allNotes.length}\n`);
       }
     } catch (e) {
-      console.error(`\n[CDP] 解析失败: ${e.message}`);
+      console.error(`[CDP] 解析失败: ${e.message}`);
     }
 
-    // 放行响应
+    // 关键: 必须把真实的响应 body 回传给页面，否则页面收到空响应
     try {
       await client.send('Fetch.fulfillRequest', {
         requestId: params.requestId,
-        responseCode: params.responseStatusCode || 200,
-        responseHeaders: params.responseHeaders || [],
-        body: params.body || '',
+        responseCode,
+        responseHeaders,
+        body: rawBody,  // 原始 base64 编码的响应体
       });
     } catch {
-      try { await client.send('Fetch.continueResponse', { requestId: params.requestId }); }
-      catch { try { await client.send('Fetch.continueRequest', { requestId: params.requestId }); } catch {} }
+      try { await client.send('Fetch.continueResponse', { requestId: params.requestId }); } catch {}
     }
   });
 
-  // 导航到笔记管理页
   if (!opts.json) process.stderr.write('[检测] 正在打开笔记管理页...\n');
   await page.goto('https://creator.xiaohongshu.com/new/note-manager', {
     waitUntil: 'domcontentloaded',
@@ -156,28 +136,58 @@ async function main() {
   });
   await page.waitForTimeout(10000);
 
-  // 滚动加载更多笔记
-  if (!opts.json) process.stderr.write('\n[检测] 滚动加载更多...\n');
-  let stableCount = 0;
-  let prevCount = allNotes.length;
+  if (!opts.json) process.stderr.write(`[检测] 第1页: ${allNotes.length} 篇, has_more: ${firstPageHasMore}\n`);
 
-  for (let i = 0; i < 25 && hasMore; i++) {
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-    await page.waitForTimeout(3000);
+  // ── 步骤2: 保持 Fetch 拦截，用 CDP Input 滚轮事件触发分页加载 ──
+  // XHR/fetch 从主 frame 调用缺少 X-S 签名头，只能让页面自己发请求
+  // qiankun 微应用用 IntersectionObserver 监听加载指示器
+  // 需要用 CDP Input.dispatchMouseEvent(mouseWheel) 触发真实滚动
 
-    if (allNotes.length > prevCount) {
-      prevCount = allNotes.length;
-      stableCount = 0;
-    } else {
-      stableCount++;
-      if (stableCount >= 3) break;
+  if (firstPageHasMore) {
+    if (!opts.json) process.stderr.write('[检测] 通过 CDP 滚轮事件加载更多...\n');
+
+    // 获取 div.content 的位置信息
+    const contentBox = await page.evaluate(() => {
+      const c = document.querySelector('div.content');
+      if (!c) return null;
+      const r = c.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2, w: r.width, h: r.height };
+    });
+
+    const scrollX = contentBox ? Math.round(contentBox.x) : 640;
+    const scrollY = contentBox ? Math.round(contentBox.y) : 400;
+
+    let stableCount = 0;
+    let prevCount = allNotes.length;
+
+    for (let i = 0; i < 50; i++) {
+      // 派发真实鼠标滚轮事件
+      await client.send('Input.dispatchMouseEvent', {
+        type: 'mouseWheel',
+        x: scrollX,
+        y: scrollY,
+        deltaX: 0,
+        deltaY: 600,
+      });
+
+      await page.waitForTimeout(2000);
+
+      if (allNotes.length > prevCount) {
+        if (!opts.json) process.stderr.write(`\r[检测] 累计 ${allNotes.length} / ~41 篇`);
+        prevCount = allNotes.length;
+        stableCount = 0;
+      } else {
+        stableCount++;
+        if (stableCount >= 5) break;
+      }
     }
+    if (!opts.json) process.stderr.write('\n');
   }
 
-  await page.waitForTimeout(2000);
   if (!opts.json) process.stderr.write(`\n[检测] 完成，共 ${allNotes.length} 篇笔记\n\n`);
 
-  // 整理结果
+  // ── 输出 ───────────────────────────────────────────────────
+
   const results = allNotes.map(n => {
     const level = n.level !== undefined ? n.level : null;
     const [label, desc] = getLevelLabel(level);
@@ -192,9 +202,10 @@ async function main() {
     };
   });
 
-  const filtered = opts.throttledOnly ? results.filter(n => n.level !== null && n.level < 0) : results;
+  const filtered = opts.throttledOnly
+    ? results.filter(n => n.level !== null && n.level < 0)
+    : results;
 
-  // 输出
   if (opts.json) {
     const levelDist = {};
     for (const n of results) {
@@ -217,7 +228,6 @@ async function main() {
     console.log(`   总笔记数: ${results.length}`);
     console.log('═'.repeat(60));
 
-    // 统计
     const stats = {};
     for (const n of results) {
       const lv = n.level === null ? 'unknown' : n.level;
@@ -229,7 +239,6 @@ async function main() {
       console.log(`   L${lv} ${label}: ${stats[lv]} 篇`);
     }
 
-    // 限流笔记
     const throttled = results.filter(n => n.level !== null && n.level < 0);
     if (throttled.length > 0) {
       console.log(`\n⚠️  限流笔记 (${throttled.length} 篇):`);
@@ -242,7 +251,6 @@ async function main() {
       console.log('\n✅ 无限流笔记');
     }
 
-    // 正常笔记
     if (!opts.throttledOnly) {
       const normal = results.filter(n => n.level === null || n.level >= 0);
       if (normal.length > 0) {
