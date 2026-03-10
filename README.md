@@ -17,11 +17,46 @@
 | -5 🔴🔴 | 中度限流 | 几乎无推荐 |
 | -102 ⛔ | 严重限流 | 不可逆，需删除重发 |
 
+## 两种检测方式
+
+### 方式一：CDP 浏览器拦截（推荐）✅
+
+通过 Playwright CDP Fetch domain 拦截浏览器内的 API 响应，绕过签名验证。
+
+**优点**: 无需导出 cookies，无需处理 X-S 签名，100% 可靠
+**前置条件**: Node.js + `playwright`，Chrome 以 remote-debugging 启动
+
+```bash
+# 通过 OpenClaw browser-lock.sh
+./scripts/browser-lock.sh run check-cdp.js
+
+# 或直接运行（需自行管理 Chrome CDP）
+node check-cdp.js --cdp-port 9222
+
+# JSON 输出
+node check-cdp.js --json
+
+# 只看限流笔记
+node check-cdp.js --throttled-only
+```
+
+### 方式二：Cookie + HTTP 请求
+
+直接用 Python requests 调用 API。**注意：XHS API 需要 X-S/X-T 签名头，纯 cookie 请求大概率返回 `{"code":-1}`**。此方式仅在 XHS 未严格校验签名时可用。
+
+**前置条件**: Python 3 + `requests`，有效的 cookies JSON 文件
+
+```bash
+python3 check.py --cookies /path/to/cookies.json
+python3 check.py --throttled-only
+python3 check.py --json
+```
+
 ## 功能
 
 - **📊 全量检测** — 分页获取所有笔记，逐一检测 level 状态
-- **⚠️ 敏感词检测** — 50+ 内置高危词（AI自动化、极限词、引流词等）
-- **📛 标签风险** — 话题标签 >5 个自动提示
+- **⚠️ 敏感词检测** — 50+ 内置高危词（AI自动化、极限词、引流词等）（Python 版）
+- **📛 标签风险** — 话题标签 >5 个自动提示（Python 版）
 - **📋 Markdown 报告** — 按限流等级分组，一目了然
 - **🤖 JSON 输出** — 适合 agent 程序化处理
 
@@ -31,59 +66,77 @@
 # 通过 ClawHub
 clawhub install xhs-note-health
 
-# 或手动复制到 skills 目录
+# 或手动
 cp -r xhs-note-health ~/.openclaw/workspace/skills/
+cd xhs-note-health && npm install playwright  # CDP 版
 ```
 
-## 前置条件
+## 技术细节
 
-1. **Python 3** + `requests` 库
-2. **小红书创作者后台 Cookies** — 从浏览器导出为 JSON 文件
-   - 默认路径: `~/tools/xiaohongshu-mcp/xiaohongshu_cookies.json`
-   - 格式: `[{name, value, domain, ...}, ...]` 或 `{name: value, ...}`
-   - 有效期约 30 天
+### 为什么需要 CDP 方式？
 
-### 导出 Cookies
+小红书创作者后台使用了多层防护：
 
-使用浏览器扩展（如 EditThisCookie、Cookie-Editor）导出 `creator.xiaohongshu.com` 的 cookies 为 JSON 格式。
+1. **X-S 签名头** — API 请求需要 `X-S`、`X-T` 等由前端 JS SDK 动态生成的签名头，仅靠 cookie 无法通过验证
+2. **qiankun 微前端沙箱** — 创作者后台使用 qiankun 框架，全局 `fetch`/`XMLHttpRequest` 被沙箱隔离，无法通过 monkey-patch 拦截
+3. **Playwright 限制** — 在 `connectOverCDP` 模式下，`page.on('response')` 和 `page.route()` 不会触发
 
-## 使用
+**CDP Fetch domain** 工作在浏览器网络层，绕过所有 JS 层面的限制：
 
-```bash
-# 检测所有笔记
-python3 check.py
-
-# 指定 cookies 路径
-python3 check.py --cookies /path/to/cookies.json
-
-# 只看限流笔记
-python3 check.py --throttled-only
-
-# JSON 输出
-python3 check.py --json
-
-# 保存报告
-python3 check.py --output report.md
+```
+浏览器网络层 (CDP Fetch domain) ← 我们在这里拦截
+    ↓
+qiankun 沙箱 (隔离 JS 全局变量)
+    ↓
+微应用 fetch/XHR (带 X-S 签名)
+    ↓
+XHS API 服务器
 ```
 
-## Agent 使用
+### API 响应结构
 
-当用户说"检测小红书限流"、"笔记健康检查"、"小红书笔记状态"时，运行 `check.py` 并汇总报告。
+```
+endpoint: /api/galaxy/v2/creator/note/user/posted?tab=0&page=0
+response.data.notes[]   ← 注意是 "notes" 不是 "note_list"
+  .id                   ← 注意是 "id" 不是 "note_id"
+  .level                ← 隐藏的推荐等级
+  .display_title
+  .likes
+  .time
+```
 
-## 敏感词分类
+### CDP 拦截关键代码
 
-| 分类 | 示例 |
-|------|------|
-| AI/自动化 | AI生成, 自动化, 批量, 内容工厂 |
-| 极限词 | 最好, 第一, 唯一, 顶级 |
-| 虚假承诺 | 包过, 稳赚不赔, 零风险 |
-| 医疗夸大 | 根治, 特效, 一次见效 |
-| 站外引流 | 微信, 加V, VX |
-| 诱导互动 | 互粉, 求关注, 一键三连 |
+```javascript
+// 1. 启用 Fetch domain（Response 阶段拦截）
+await client.send('Fetch.enable', {
+  patterns: [{ urlPattern: '*note/user/posted*', requestStage: 'Response' }],
+});
+
+// 2. 监听 requestPaused 事件
+client.on('Fetch.requestPaused', async (params) => {
+  // 获取响应 body
+  const { body, base64Encoded } = await client.send('Fetch.getResponseBody', {
+    requestId: params.requestId,
+  });
+  // 解析 level 字段...
+
+  // 放行响应（必须用 fulfillRequest，不是 continueRequest）
+  await client.send('Fetch.fulfillRequest', {
+    requestId: params.requestId,
+    responseCode: params.responseStatusCode,
+    responseHeaders: params.responseHeaders,
+    body: params.body,
+  });
+});
+```
+
+> ⚠️ Response 阶段必须用 `Fetch.fulfillRequest` 放行，`Fetch.continueRequest` 仅适用于 Request 阶段。
 
 ## 致谢
 
-限流检测原理参考 [jzOcb/xhs-note-health-checker](https://github.com/jzOcb/xhs-note-health-checker)（Chrome 扩展版）。
+- 限流检测原理参考 [jzOcb/xhs-note-health-checker](https://github.com/jzOcb/xhs-note-health-checker)（Chrome 扩展版）
+- 隐藏 level 字段发现来源: [@xxx111god](https://x.com/xxx111god/status/2030837261516845106)
 
 ## License
 
