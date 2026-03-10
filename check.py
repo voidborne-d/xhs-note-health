@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """
-xhs-note-health — 小红书笔记限流状态检测
+xhs-note-health v1.1.0 — 小红书笔记限流状态检测
 通过创作者后台 API 获取所有笔记的 level 字段，判断限流等级。
 
 用法:
     python3 check.py [--cookies PATH] [--throttled-only] [--json] [--output PATH]
+
+更新日志 (v1.1.0):
+- 增加限流笔记编辑链接
+- 报告增加互动数据 (点赞/评论/收藏/分享)
+- 限流原因说明优化（去掉冗余 "level低于1"）
+- 新增 --sort 参数 (level/likes/comments)
 """
 
 import argparse
@@ -251,9 +257,16 @@ def generate_report(notes: list) -> str:
         lines.append(f"\n### ⚠️ 限流笔记 ({len(throttled)} 篇)\n")
         for n in sorted(throttled, key=lambda x: x["level"]):
             lines.append(f"- **{n['level_label']}** | {n['title'][:50]}")
-            lines.append(f"  - ID: `{n['note_id']}` | {n['level_desc']}")
+            edit_url = f"https://creator.xiaohongshu.com/publish/publish?noteId={n['note_id']}"
+            lines.append(f"  - {n['level_desc']} | [✏️ 编辑]({edit_url})")
+            lines.append(f"  - 👍 {n['likes']} 💬 {n['comments']} ⭐ {n['collects']} 🔄 {n['shares']}")
+            reasons = []
             if n["sensitive_hits"]:
-                lines.append(f"  - ⚠️ 敏感词: {', '.join(n['sensitive_hits'])}")
+                reasons.append(f"敏感词: {', '.join(n['sensitive_hits'])}")
+            if n["tag_warning"]:
+                reasons.append(f"标签过多: {n['tag_count']} 个")
+            if reasons:
+                lines.append(f"  - ⚠️ {' | '.join(reasons)}")
     else:
         lines.append("\n### ✅ 无限流笔记\n")
 
@@ -274,7 +287,7 @@ def generate_report(notes: list) -> str:
     if normal:
         lines.append(f"\n### 📋 正常笔记 ({len(normal)} 篇)\n")
         for n in sorted(normal, key=lambda x: -x["level"]):
-            lines.append(f"- {n['level_label']} | {n['title'][:50]}")
+            lines.append(f"- {n['level_label']} | {n['title'][:50]} | 👍{n['likes']} 💬{n['comments']} ⭐{n['collects']}")
 
     return "\n".join(lines)
 
@@ -291,6 +304,8 @@ def main():
                         help="JSON 格式输出")
     parser.add_argument("--output", "-o", type=str, default=None,
                         help="保存报告到文件")
+    parser.add_argument("--sort", choices=["level", "likes", "comments", "collects"],
+                        default="level", help="排序方式 (默认: level)")
 
     args = parser.parse_args()
 
@@ -310,6 +325,16 @@ def main():
 
     if args.throttled_only:
         notes = [n for n in notes if n["level"] < 0]
+
+    # 排序
+    sort_keys = {
+        "level": lambda x: x["level"],
+        "likes": lambda x: -x["likes"],
+        "comments": lambda x: -x["comments"],
+        "collects": lambda x: -x["collects"],
+    }
+    if args.sort in sort_keys:
+        notes.sort(key=sort_keys[args.sort])
 
     # 输出
     if args.json:

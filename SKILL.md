@@ -1,7 +1,7 @@
 ---
 name: xhs-note-health
 version: "1.1.0"
-description: "检测小红书笔记限流状态。通过 CDP Fetch domain 拦截创作者后台 API，获取隐藏的 level 字段判断推荐等级。"
+description: "检测小红书笔记限流状态。通过创作者后台 API 获取所有笔记的 level 字段，判断限流等级、敏感词命中、标签风险。"
 author: "d (voidborne)"
 ---
 
@@ -11,7 +11,7 @@ author: "d (voidborne)"
 
 ## 原理
 
-小红书创作者后台 API `/api/galaxy/v2/creator/note/user/posted` 返回的每篇笔记包含隐藏的 `level` 字段，表示推荐分发等级：
+小红书创作者后台 API `/api/galaxy/v2/creator/note/user/posted` 返回的每篇笔记包含 `level` 字段，表示推荐分发等级：
 
 | Level | 状态 | 说明 |
 |-------|------|------|
@@ -22,66 +22,65 @@ author: "d (voidborne)"
 | -5 🔴🔴 | 中度限流 | 几乎无推荐 |
 | -102 ⛔ | 严重限流 | 不可逆，需删除重发 |
 
-## 两种检测方式
+## 前置条件
 
-### 方式一：CDP 浏览器拦截（推荐）
+1. **Cookies 文件** — 需要小红书创作者后台的有效 cookies
+   - 默认路径: `~/tools/xiaohongshu-mcp/xiaohongshu_cookies.json`
+   - 可通过 `--cookies` 参数指定其他路径
+   - 格式: JSON 数组，每个元素包含 `name` 和 `value` 字段
+   - Cookies 有效期约 30 天，过期需重新从浏览器导出
 
-通过 Playwright CDP Fetch domain 在 Response 阶段拦截 API 响应，绕过 X-S 签名验证和 qiankun 沙箱。
+2. **Python 3** + `requests` 库
 
-**前置条件:**
-- Node.js + `playwright`
-- Chrome 以 remote-debugging 启动（或 OpenClaw 管理的浏览器）
-- 已登录小红书创作者后台
+## 使用方法
 
 ```bash
-# OpenClaw 环境
-./scripts/browser-lock.sh run <skill_dir>/check-cdp.js
+# 检测所有笔记
+python3 <skill_dir>/check.py
 
-# 手动指定 CDP 端口
-node <skill_dir>/check-cdp.js --cdp-port 9222
-
-# JSON 输出
-node <skill_dir>/check-cdp.js --json
+# 指定 cookies 路径
+python3 <skill_dir>/check.py --cookies /path/to/cookies.json
 
 # 只看限流笔记
-node <skill_dir>/check-cdp.js --throttled-only
-```
-
-### 方式二：Cookie + HTTP 请求（不推荐）
-
-直接用 Python requests 调用 API。XHS API 通常需要 X-S/X-T 签名头，此方式仅在签名未严格校验时可用。
-
-**前置条件:**
-- Python 3 + `requests`
-- Cookies JSON 文件（从浏览器导出）
-
-```bash
-python3 <skill_dir>/check.py --cookies /path/to/cookies.json
-python3 <skill_dir>/check.py --json
 python3 <skill_dir>/check.py --throttled-only
+
+# 按点赞数排序
+python3 <skill_dir>/check.py --sort likes
+
+# JSON 输出（适合程序处理）
+python3 <skill_dir>/check.py --json
+
+# 保存报告到文件
+python3 <skill_dir>/check.py --output report.md
 ```
 
 ## Agent 使用指南
 
 当用户要求检测小红书笔记限流状态时：
 
-1. **优先使用 CDP 版** (`check-cdp.js`)，需要浏览器可用
-2. 如果浏览器不可用，退回 Python 版 (`check.py`)，提醒用户可能因签名失败
-3. 汇总报告：总笔记数、各 level 分布、限流笔记列表
-4. 对限流笔记给出建议（删除重发 / 检查内容 / 等待）
+1. 运行 `check.py` 脚本获取结果
+2. 汇总报告：总笔记数、各 level 分布、限流笔记列表、敏感词命中
+3. 如果 cookies 过期 (返回 401/903)，提醒用户重新导出 cookies
 
-### 技术要点
+### 示例调用
 
-- **API 响应结构**: `data.notes[]`（不是 `data.note_list`）
-- **笔记 ID 字段**: `id`（不是 `note_id`）
-- **CDP 拦截**: 必须用 `Fetch.enable` + `requestStage: 'Response'` + `Fetch.fulfillRequest` 放行
-- **不可行方案**: JS monkey-patch（qiankun 沙箱隔离）、page.route()（CDP 连接模式不触发）、直接 fetch（缺签名头）
+```bash
+python3 ~/.openclaw/workspace/skills/xhs-note-health/check.py --json
+```
 
-## 敏感词检测（Python 版）
+解析 JSON 输出后，给用户一份简洁的中文报告。
 
-内置 50+ 高危敏感词，覆盖：AI/自动化、极限词、虚假承诺、医疗功效夸大、站外引流、诱导互动、营销限时词。
+## 敏感词检测
+
+内置 50+ 高危敏感词，覆盖以下类别：
+- AI/自动化相关
+- 极限词/绝对化用语
+- 虚假承诺
+- 医疗功效夸大
+- 站外引流词
+- 诱导互动
+- 营销限时词
 
 ## 致谢
 
-- 限流检测原理参考 [jzOcb/xhs-note-health-checker](https://github.com/jzOcb/xhs-note-health-checker)
-- 隐藏 level 字段发现: [@xxx111god](https://x.com/xxx111god/status/2030837261516845106)
+限流检测原理参考 [jzOcb/xhs-note-health-checker](https://github.com/jzOcb/xhs-note-health-checker)（Chrome 扩展版）。
